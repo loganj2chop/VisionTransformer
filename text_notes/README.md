@@ -1,0 +1,177 @@
+# Renal Radiology Note Rewriting & Image-to-Note Generation
+
+A two-stage pipeline for cleaning radiology reports and learning to generate renal-focused notes directly from CT imaging.
+
+**Stage 1** uses MedGemma-27B to rewrite free-text radiology notes, stripping non-renal content and temporal references to produce clean, scan-specific findings. **Stage 2** trains a multimodal model (MViT + adapter + MedGemma) to generate renal-focused notes directly from CT volumes.
+
+---
+
+## Pipeline Overview
+
+```
+Raw Radiology Notes (CSV)
+        │
+        ▼
+   rewrite.py  ──►  Cleaned renal-focused notes (CSV)
+                              │
+                              ▼
+              + NIfTI volumes + kidney masks
+                              │
+                              ▼
+         image_to_llm.py  ──►  Trained multimodal checkpoint (.pt)
+                                (MViT → Adapter → MedGemma)
+```
+
+---
+
+## Scripts
+
+### `rewrite.py` — Renal-Focused Note Rewriting
+
+Uses MedGemma-27B to rewrite free-text radiology reports, retaining only clinically relevant urinary tract findings from the **current scan**. The rewritten notes are suitable as training targets for generative models and as cleaner label sources.
+
+**What is removed:**
+- Comparisons to prior imaging studies
+- Dates, times, and temporal references
+- Non-genitourinary findings (liver, spleen, lungs, bowel, etc.)
+
+**What is kept:**
+- Positive renal/urinary findings
+- Explicitly stated negative findings (e.g., "no hydronephrosis")
+- Concise, professional radiology language
+
+**Input CSV columns required:**
+
+| Column | Description |
+|---|---|
+| `note` | Raw free-text radiology report |
+| `acc_num` | Accession number (used for logging; optional) |
+
+**Output:** `notes_medgemma27_renal_rewrite.csv` — original CSV with an added `renal_focused_note` column.
+
+**Run:**
+```bash
+python rewrite.py
+```
+
+> Notes are capped at 8,000 characters before being sent to the model. Output is decoded greedily (`do_sample=False`) for reproducibility.
+
+---
+
+### `image_to_llm.py` — CT-to-Note Multimodal Training
+
+Trains a multimodal architecture that conditions MedGemma on CT imaging to generate renal-focused radiology notes. The model learns to map visual features from axial CT slices into the LLM's token embedding space via a lightweight adapter.
+
+**Architecture:**
+
+```
+CT Volume (NIfTI)
+      │
+      ▼
+  MViT-v2-S                  ← frozen ImageNet weights, float32
+  (16-frame axial clip)
+      │
+      ▼
+  Visual Adapter             ← trained from scratch
+  (MLP → 8 visual tokens)
+      │
+      ▼
+  [VIS_TOKENS | TEXT_TOKENS] ← concatenated in embedding space
+      │
+      ▼
+  MedGemma-27B               ← frozen LLM, bfloat16
+      │
+      ▼
+  Cross-entropy loss over text tokens only
+```
+
+**Key design choices:**
+
+- **LLM is frozen** — only the adapter (and optionally the MViT backbone) are trained.
+- **Dtype handling:** Vision runs in `float32`; visual tokens are cast to `bfloat16` before concatenation with text embeddings to match the LLM's dtype.
+- **Visual prefix masking:** Loss is computed only on the text tokens (`labels=-100` for the visual prefix), so the model is not penalized for the visual token positions.
+- **Bilateral-aware slice sampling:** Slices where both kidneys are visible are prioritized; the epoch seed ensures a fresh random sample per epoch.
+- **4-channel vs. 3-channel:** This script uses grayscale CT replicated to 3 channels (no mask channel), keeping the MViT weights compatible with DEFAULT pretrained weights.
+
+**Input CSV columns required:**
+
+| Column | Description |
+|---|---|
+| `nifti` | Path to CT volume (`.nii` / `.nii.gz`) |
+| `mask` | Path to kidney segmentation mask (NIfTI) |
+| `note_clean` | Renal-focused note (output from `rewrite.py`) |
+
+**Run:**
+```bash
+python image_to_llm.py \
+    --csv data.csv \
+    --epochs 5 \
+    --batch_size 1 \
+    --lr 1e-4 \
+    --out renal_note_generator.pt
+```
+
+**All arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--csv` | *(required)* | Input CSV with `nifti`, `mask`, `note_clean` columns |
+| `--epochs` | `5` | Number of training epochs |
+| `--batch_size` | `1` | Batch size (1–2 recommended given GPU memory) |
+| `--lr` | `1e-4` | AdamW learning rate |
+| `--num_workers` | `0` | DataLoader workers |
+| `--out` | `renal_note_generator.pt` | Output checkpoint path |
+
+---
+
+## Installation
+
+```bash
+pip install torch torchvision
+pip install transformers accelerate
+pip install nibabel pandas scipy
+```
+
+> MedGemma requires a Hugging Face account and acceptance of the model license. Authenticate before running either script:
+> ```bash
+> huggingface-cli login
+> ```
+
+**GPU memory requirements:**
+
+| Script | Approximate VRAM |
+|---|---|
+| `rewrite.py` | ~55 GB (MedGemma-27B bfloat16) |
+| `image_to_llm.py` | ~60+ GB (MedGemma-27B + MViT + adapter); `device_map="auto"` recommended for multi-GPU |
+
+---
+
+## Output Files
+
+| File | Generated by | Contents |
+|---|---|---|
+| `notes_medgemma27_renal_rewrite.csv` | `rewrite.py` | Original CSV + `renal_focused_note` column |
+| `renal_note_generator.pt` | `image_to_llm.py` | Adapter + MViT state dict (LLM weights not saved — reload from HuggingFace) |
+
+---
+
+## Recommended Workflow
+
+```
+1. Run rewrite.py
+       └─► notes_medgemma27_renal_rewrite.csv
+
+2. Join rewritten notes to your imaging CSV
+       └─► add "note_clean" column pointing to renal_focused_note
+
+3. Run image_to_llm.py
+       └─► renal_note_generator.pt
+```
+
+---
+
+## Notes
+
+- `batch_size=1` is the safest default for `image_to_llm.py` given the combined memory footprint of MedGemma-27B and MViT. Gradient accumulation can be added to simulate larger batches.
+- The LLM is frozen by default. Fine-tuning MedGemma with LoRA/QLoRA in addition to the adapter is a natural next step for higher-quality note generation.
+- CT volumes should be in NIfTI format with the axial plane along the Z axis. Kidney masks with any label > 0 are treated as kidney.
